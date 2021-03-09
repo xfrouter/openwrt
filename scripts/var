@@ -1,0 +1,259 @@
+#!/bin/bash
+BASEDIR="$PWD"
+VARDIR="$PWD/custom/var"
+export GREP_OPTIONS=
+
+usage() {
+	cat <<EOF
+Usage: $0 [options] <command> [arguments]
+Commands:
+	help              This help text
+	list              List all environments
+	clear             Delete all environment
+	new <name>        Create a new environment
+	switch <name>     Switch to a different environment
+	delete <name>     Delete an environment
+	rename <newname>  Rename the current environment
+	diff              Show differences between current state and environment
+	save              Save your changes to the environment
+	revert            Revert your changes since last save
+
+Options:
+
+EOF
+	exit ${1:-1}
+}
+
+error() {
+	echo "$0: $*"
+	exit 1
+}
+
+ask_bool() {
+	local DEFAULT="$1"; shift
+	local def defstr val
+	case "$DEFAULT" in
+		1) def=0; defstr="Y/n";;
+		0) def=1; defstr="y/N";;
+		*) def=;  defstr="y/n";;
+	esac
+	while [ -z "$val" ]; do
+		local VAL
+
+		echo -n "$* ($defstr): "
+		read VAL
+		case "$VAL" in
+			y*|Y*) val=0;;
+			n*|N*) val=1;;
+			*) val="$def";;
+		esac
+	done
+	return "$val"
+}
+
+var_init() {
+	local CREATE="$1"
+	if [ -z "$CREATE" ]; then
+		if [ ! -f "$BASEDIR/.config" -a -d "$VARDIR" ]; then
+			echo "null" > $VARDIR/index
+		fi
+		[ -d "$VARDIR" ] || exit 0
+	fi
+	mkdir -p "$VARDIR" || error "Failed to create the environment directory"
+	cd "$VARDIR" || error "Failed to switch to the environment directory"
+
+	[ -f index ] || {
+		touch index &&
+		echo "null" > index
+	}
+
+	[ -f null ] || { 
+		touch null &&
+		touch index &&
+		echo "null" > index
+	} || {
+		rm -rf null index
+		error "Failed to initialize the environment directory"
+	}
+}
+
+var_sync_data() {
+	local index
+
+	index="$(var_get_index)"
+	[ $index != "null" -a \! -L "$BASEDIR/.config" -a -f "$BASEDIR/.config" ] && cp -a "$BASEDIR/.config" "$VARDIR/$index"
+}
+
+var_sync() {
+	local STR="$1"
+	var_sync_data
+
+	if [ \! -L "$BASEDIR/.config" -a -f "$BASEDIR/.config" ]; then
+		cp -a "$BASEDIR/.config" "$VARDIR/$STR"
+		echo "$STR" > "$VARDIR/index"
+	else
+		error "$BASEDIR/.config was missing or symbolic link"
+	fi
+}
+
+var_get_index() {
+	local curr
+
+	if [ -f "$VARDIR/index" ]; then
+		curr="$(cat $VARDIR"/"index | awk '{print $1}')"
+		if [ ! -f "$VARDIR/$curr" ]; then
+			curr="null"
+		fi
+	else
+		curr="null"
+	fi
+
+	echo "$curr"
+}
+
+var_list() {
+	local branch index
+
+	var_init
+	index="$(var_get_index)"
+	for branch in `ls $VARDIR`
+	do
+		if [ $branch = $index ]; then
+			printf " * %s\n" $branch
+		elif [ $branch != "index" ]; then
+			printf "   %s\n" $branch
+		fi
+	done
+}
+
+var_diff() {
+	local index
+
+	var_init
+	index="$(var_get_index)"
+	if [ -f "$BASEDIR/.config" -a -f "$VARDIR/$index" ]; then
+		diff -y --suppress-common-lines "$BASEDIR/.config" "$VARDIR/$index"
+	fi
+}
+
+var_save() {
+	var_init
+	var_sync_data
+}
+
+var_revert() {
+	local index
+
+	var_init
+	index="$(var_get_index)"
+	cp -a "$VARDIR/$index" "$BASEDIR/.config"
+}
+
+var_ask_sync() {
+	LINES="$(var_diff | wc -l)" # implies var_init
+	[ "$LINES" -gt 0 ] && {
+		if ask_bool 1 "Do you want to save your changes"; then
+			var_sync
+		fi
+	}
+}
+
+var_clear() {
+	if ask_bool 0 "Do you want remove all of the config(s)?"; then
+		cd "$BASEDIR"
+		rm -rf "$VARDIR"
+	fi
+}
+
+var_delete() {
+	local index del deleted name="${1##*/}"
+	var_init
+	[ -z "$name" ] && usage && return
+
+	[ $name = "null" ] && error "cannot delete this one"
+
+	deleted="none"
+	for del in `ls $VARDIR`
+	do
+		if [ $del = $name ]; then
+			rm -f $VARDIR/$name
+			deleted=$name
+		fi
+	done
+
+	index="$(var_get_index)"
+	[ $index = $deleted ] && echo "null" > "$VARDIR/index"
+
+	[ $deleted = "none" ] && error "'$name' was not exist"
+}
+
+var_switch() {
+	local switch new name="${1##*/}"
+	[ -z "$name" ] && usage
+
+	var_ask_sync
+	
+	new="none"
+	for switch in `ls $VARDIR`
+	do
+		if [ $switch = $name ]; then
+			new=$name
+		fi
+	done
+
+	[ $new = "none" ] && error "'$name' was not exist"
+
+	cp -a "$VARDIR/$name" "$BASEDIR/.config"
+	echo "$name" > "$VARDIR/index"
+}
+
+var_rename() {
+	local index curr name="${1##*/}"
+
+	[ $name = "null" ] && error "cannot rename to this one"
+	
+	index="$(var_get_index)"
+	[ $index = "null" ] && error "cannot rename this one"
+	
+	mv "$VARDIR/$index" "$VARDIR/$name"
+	echo "$name" > "$VARDIR/index"
+}
+
+var_new() {
+	local NAME="$1"
+	local curr
+	local from="null"
+
+	[ -z "$NAME" ] && usage
+	var_init 1
+	
+	curr="$(cat $VARDIR"/"index | awk '{print $1}')"
+	if [ -n "$curr" -a "$curr" != "null" ]; then
+		var_ask_sync
+	fi
+
+	if [ -f "$BASEDIR/.config" ]; then
+		if ask_bool 1 "Do you want to clone the current environment?"; then
+			var_sync $NAME
+		else
+			rm -rf "$BASEDIR/.config"
+		fi
+	else
+		error "$BASEDIR/.config was missing"
+	fi
+}
+
+COMMAND="$1"; shift
+case "$COMMAND" in
+	help) usage 0;;
+	new) var_new "$@";;
+	list) var_list "$@";;
+	clear) var_clear "$@";;
+	switch) var_switch "$@";;
+	delete) var_delete "$@";;
+	rename) var_rename "$@";;
+	diff) var_diff "$@";;
+	save) var_save "$@";;
+	revert) var_revert "$@";;
+	*) usage;;
+esac
